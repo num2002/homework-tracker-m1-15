@@ -122,8 +122,9 @@ https://docs.google.com/spreadsheets/d/1JnxohQh-anm6HFJZudMOLHvnDl8osa-j2V7ynQhY
 
 1. เข้าบัญชี GitHub `num2002`
 2. สร้าง repository ใหม่ชื่อ `homework-tracker-m1-15`
-3. ตั้งเป็น **Private** เพื่อไม่ให้ไฟล์ข้อมูลนักเรียนเปิดเผย
-4. อัปโหลดไฟล์โปรเจกต์ทั้งหมด ยกเว้น `.venv`, `node_modules` และ `.streamlit/secrets.toml`
+3. ตั้งเป็น **Public** สำหรับ Streamlit Community Cloud แบบฟรี โดยเก็บเฉพาะโค้ด
+4. ห้ามอัปโหลด `Homework_Tracker_M1_15.xlsx`, `.venv`, `node_modules`, ไฟล์ JSON ของ Service Account และ `.streamlit/secrets.toml`
+5. ข้อมูลนักเรียนจริงต้องอยู่ใน Google Sheet ที่จำกัดสิทธิ์เท่านั้น
 
 ### ขั้นที่ 4 — Deploy บน Streamlit Community Cloud
 
