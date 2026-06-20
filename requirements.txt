@@ -1,0 +1,5 @@
+streamlit>=1.40,<2
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+gspread>=6.1,<7
+google-auth>=2.30,<3
