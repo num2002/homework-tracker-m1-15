@@ -337,6 +337,130 @@ def student_pin_accounts(master_password: str) -> list[dict[str, str | int]]:
     ]
 
 
+def parent_pin_digest(master_password: str, pin: str) -> str:
+    """Hash a parent PIN with the app secret so the real PIN is never stored."""
+    return hmac.new(
+        master_password.encode("utf-8"),
+        f"parent-pin:{pin}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_parent_pin_overrides() -> dict[int, str]:
+    if google_sheets_configured():
+        spreadsheet = get_google_spreadsheet()
+        try:
+            worksheet = spreadsheet.worksheet("Parent_Auth")
+        except WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Parent_Auth", rows=100, cols=3)
+            worksheet.update([["เลขที่", "PIN_Hash", "เปลี่ยนล่าสุด"]], "A1")
+        values = worksheet.get_all_values()
+        result = {}
+        for row in values[1:]:
+            if len(row) >= 2 and row[0] and row[1]:
+                try:
+                    result[int(float(row[0]))] = row[1]
+                except ValueError:
+                    continue
+        return result
+
+    _normalize_workbook(EXCEL_FILE)
+    workbook = load_workbook(EXCEL_FILE, read_only=True)
+    if "Parent_Auth" not in workbook.sheetnames:
+        workbook.close()
+        return {}
+    worksheet = workbook["Parent_Auth"]
+    result = {}
+    for number, pin_hash, *_ in worksheet.iter_rows(min_row=2, values_only=True):
+        if number and pin_hash:
+            result[int(number)] = str(pin_hash)
+    workbook.close()
+    return result
+
+
+def verify_parent_pin(master_password: str, student_number: int, candidate: str) -> bool:
+    normalized = candidate.strip()
+    override = load_parent_pin_overrides().get(student_number)
+    if override:
+        return hmac.compare_digest(parent_pin_digest(master_password, normalized), override)
+    return hmac.compare_digest(normalized.upper(), student_pin(master_password, student_number))
+
+
+def set_parent_pin(master_password: str, student_number: int, new_pin: str) -> None:
+    pin_hash = parent_pin_digest(master_password, new_pin.strip())
+    changed_at = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
+    if google_sheets_configured():
+        spreadsheet = get_google_spreadsheet()
+        try:
+            worksheet = spreadsheet.worksheet("Parent_Auth")
+        except WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Parent_Auth", rows=100, cols=3)
+            worksheet.update([["เลขที่", "PIN_Hash", "เปลี่ยนล่าสุด"]], "A1")
+        values = worksheet.get_all_values()
+        target_row = next(
+            (
+                row_number
+                for row_number, row in enumerate(values[1:], 2)
+                if row and row[0] and int(float(row[0])) == student_number
+            ),
+            None,
+        )
+        if target_row:
+            worksheet.update([[student_number, pin_hash, changed_at]], f"A{target_row}:C{target_row}")
+        else:
+            worksheet.append_row([student_number, pin_hash, changed_at])
+    else:
+        _normalize_workbook(EXCEL_FILE)
+        workbook = load_workbook(EXCEL_FILE)
+        worksheet = workbook["Parent_Auth"] if "Parent_Auth" in workbook.sheetnames else workbook.create_sheet("Parent_Auth")
+        if worksheet.max_row == 1 and not worksheet.cell(1, 1).value:
+            worksheet.append(["เลขที่", "PIN_Hash", "เปลี่ยนล่าสุด"])
+        target_row = next(
+            (row for row in range(2, worksheet.max_row + 1) if worksheet.cell(row, 1).value == student_number),
+            worksheet.max_row + 1,
+        )
+        worksheet.cell(target_row, 1, student_number)
+        worksheet.cell(target_row, 2, pin_hash)
+        worksheet.cell(target_row, 3, changed_at)
+        _atomic_save(workbook, EXCEL_FILE)
+    load_parent_pin_overrides.clear()
+
+
+def reset_parent_pin(student_number: int) -> None:
+    if google_sheets_configured():
+        spreadsheet = get_google_spreadsheet()
+        try:
+            worksheet = spreadsheet.worksheet("Parent_Auth")
+        except WorksheetNotFound:
+            load_parent_pin_overrides.clear()
+            return
+        values = worksheet.get_all_values()
+        target_row = next(
+            (
+                row_number
+                for row_number, row in enumerate(values[1:], 2)
+                if row and row[0] and int(float(row[0])) == student_number
+            ),
+            None,
+        )
+        if target_row:
+            worksheet.delete_rows(target_row)
+    else:
+        _normalize_workbook(EXCEL_FILE)
+        workbook = load_workbook(EXCEL_FILE)
+        if "Parent_Auth" in workbook.sheetnames:
+            worksheet = workbook["Parent_Auth"]
+            for row in range(2, worksheet.max_row + 1):
+                if worksheet.cell(row, 1).value == student_number:
+                    worksheet.delete_rows(row)
+                    break
+            _atomic_save(workbook, EXCEL_FILE)
+        else:
+            workbook.close()
+    load_parent_pin_overrides.clear()
+
+
 def append_audit(action: str, detail: str = "", actor: str | None = None) -> None:
     if not google_sheets_configured():
         return
@@ -539,8 +663,7 @@ if not is_editor:
             entered_pin = st.text_input("PIN ผู้ปกครอง", type="password")
             parent_login = st.form_submit_button("ดูการบ้านของเลขที่นี้", type="primary", use_container_width=True)
         if parent_login:
-            expected_pin = student_pin(pin_secret, int(selected_number))
-            if hmac.compare_digest(entered_pin.strip().upper(), expected_pin):
+            if verify_parent_pin(pin_secret, int(selected_number), entered_pin):
                 st.session_state["parent_authenticated"] = True
                 st.session_state["parent_number"] = int(selected_number)
                 st.rerun()
@@ -554,6 +677,34 @@ if not is_editor:
         st.session_state.pop("parent_authenticated", None)
         st.session_state.pop("parent_number", None)
         st.rerun()
+
+    with st.sidebar.expander("🔑 เปลี่ยน PIN ของฉัน"):
+        with st.form("change_parent_pin", clear_on_submit=True):
+            current_pin = st.text_input("PIN ปัจจุบัน", type="password")
+            new_pin = st.text_input("PIN ใหม่", type="password", help="ใช้ตัวเลขหรือตัวอักษร 6–20 ตัว และห้ามมีช่องว่าง")
+            confirm_pin = st.text_input("ยืนยัน PIN ใหม่", type="password")
+            change_pin = st.form_submit_button("บันทึก PIN ใหม่", type="primary", use_container_width=True)
+        if change_pin:
+            errors = []
+            if not verify_parent_pin(pin_secret, parent_number, current_pin):
+                errors.append("PIN ปัจจุบันไม่ถูกต้อง")
+            if not 6 <= len(new_pin) <= 20 or any(character.isspace() for character in new_pin):
+                errors.append("PIN ใหม่ต้องยาว 6–20 ตัวและไม่มีช่องว่าง")
+            if new_pin != confirm_pin:
+                errors.append("ยืนยัน PIN ใหม่ไม่ตรงกัน")
+            if errors:
+                st.error(" · ".join(errors))
+            else:
+                try:
+                    set_parent_pin(pin_secret, parent_number, new_pin)
+                    append_audit(
+                        "เปลี่ยน PIN ผู้ปกครอง",
+                        f"เลขที่ {parent_number}",
+                        actor=f"ผู้ปกครองเลขที่ {parent_number}",
+                    )
+                    st.success("เปลี่ยน PIN เรียบร้อยแล้ว ใช้ PIN ใหม่ในการเข้าสู่ระบบครั้งถัดไป")
+                except Exception as exc:
+                    st.error(f"เปลี่ยน PIN ไม่ได้: {exc}")
 
     st.subheader(f"งานของนักเรียนเลขที่ {parent_number}")
     own_rows = tracking_df[
@@ -607,6 +758,7 @@ pages = [
     "เพิ่มการบ้าน",
     "แก้ไขการบ้าน",
     "อัปเดตสถานะส่งงาน",
+    "จัดการ PIN ผู้ปกครอง",
     "สรุปข้อความส่ง LINE",
 ]
 page = st.sidebar.radio("เมนูครู/กรรมการ", pages)
@@ -783,6 +935,31 @@ elif page == "อัปเดตสถานะส่งงาน":
                 st.success("บันทึกสถานะทั้ง 40 เลขที่แล้ว")
             except Exception as exc:
                 st.error(f"บันทึกไม่ได้: {exc}")
+
+elif page == "จัดการ PIN ผู้ปกครอง":
+    st.subheader("จัดการ PIN ผู้ปกครอง")
+    st.caption("ระบบไม่แสดง PIN ที่ผู้ปกครองตั้งเอง เพราะเก็บเฉพาะค่าแฮช ครูหรือกรรมการสามารถรีเซ็ตกลับเป็น PIN เริ่มต้นได้")
+    reset_number = st.selectbox("เลือกเลขที่นักเรียน", range(1, 41), key="reset_pin_number")
+    custom_numbers = load_parent_pin_overrides()
+    if int(reset_number) in custom_numbers:
+        st.warning(f"เลขที่ {reset_number} ใช้ PIN ที่ผู้ปกครองเปลี่ยนเองอยู่")
+    else:
+        st.success(f"เลขที่ {reset_number} ใช้ PIN เริ่มต้น")
+    st.write("PIN เริ่มต้นสำหรับเลขที่นี้:")
+    st.code(student_pin(pin_secret, int(reset_number)), language=None)
+    if st.button(
+        "รีเซ็ตกลับเป็น PIN เริ่มต้น",
+        type="primary",
+        use_container_width=True,
+        disabled=int(reset_number) not in custom_numbers,
+    ):
+        try:
+            reset_parent_pin(int(reset_number))
+            append_audit("รีเซ็ต PIN ผู้ปกครอง", f"เลขที่ {reset_number}")
+            st.success(f"รีเซ็ต PIN เลขที่ {reset_number} แล้ว")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"รีเซ็ต PIN ไม่ได้: {exc}")
 
 elif page == "สรุปข้อความส่ง LINE":
     st.subheader("สร้างข้อความสรุปสำหรับ LINE")
