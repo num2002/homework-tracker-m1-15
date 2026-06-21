@@ -623,6 +623,42 @@ def homework_label(row: pd.Series) -> str:
     return f"{row['HW_ID']} · {row['วิชา']} · {row['รายละเอียดงาน']}"
 
 
+def class_homework_summary(homework: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+    """Build a complete 1–40 class summary, treating missing tracking rows as pending."""
+    summary_rows = []
+    for _, hw in homework.sort_values("กำหนดส่ง", na_position="last").iterrows():
+        hw_id = str(hw["HW_ID"])
+        rows = tracking[tracking["HW_ID"].astype(str) == hw_id].copy()
+        rows["เลขที่"] = pd.to_numeric(rows["เลขที่"], errors="coerce")
+        rows = rows.dropna(subset=["เลขที่"]).drop_duplicates("เลขที่", keep="last")
+        status_by_number = {
+            int(row["เลขที่"]): str(row["สถานะ"] or "ยังไม่ส่ง")
+            for _, row in rows.iterrows()
+            if 1 <= int(row["เลขที่"]) <= 40
+        }
+        pending_numbers = [
+            number
+            for number in range(1, 41)
+            if status_by_number.get(number, "ยังไม่ส่ง") == "ยังไม่ส่ง"
+        ]
+        sent_count = sum(
+            status_by_number.get(number) in ["ส่งแล้ว", "ส่งช้า"]
+            for number in range(1, 41)
+        )
+        summary_rows.append(
+            {
+                "HW_ID": hw_id,
+                "วิชา": hw["วิชา"],
+                "งานที่ต้องส่ง": hw["รายละเอียดงาน"],
+                "กำหนดส่ง": hw["กำหนดส่ง"],
+                "ส่งแล้ว": sent_count,
+                "ค้างส่ง": len(pending_numbers),
+                "เลขที่ยังไม่ส่ง": ", ".join(map(str, pending_numbers)) or "ครบแล้ว 🎉",
+            }
+        )
+    return pd.DataFrame(summary_rows)
+
+
 st.set_page_config(
     page_title="Homework Tracker ม.1/15",
     page_icon="📚",
@@ -656,6 +692,27 @@ pin_secret = str(secret_value("APP_PASSWORD", "m115-local-parent-pin"))
 
 if not is_editor:
     if not st.session_state.get("parent_authenticated"):
+        st.subheader("Dashboard สรุปการบ้านของห้อง")
+        public_summary = class_homework_summary(homework_df, tracking_df)
+        if public_summary.empty:
+            st.info("ยังไม่มีการบ้าน")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("งานทั้งหมด", len(public_summary))
+            c2.metric("งานที่ยังมีคนค้าง", int((public_summary["ค้างส่ง"] > 0).sum()))
+            c3.metric("รายการค้างส่งรวม", int(public_summary["ค้างส่ง"].sum()))
+            st.dataframe(
+                public_summary.drop(columns=["HW_ID"]),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "กำหนดส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "งานที่ต้องส่ง": st.column_config.TextColumn(width="large"),
+                    "เลขที่ยังไม่ส่ง": st.column_config.TextColumn(width="large"),
+                },
+            )
+        st.caption("Dashboard แสดงเฉพาะเลขที่ ไม่แสดงชื่อหรือข้อมูลส่วนตัวของนักเรียน")
+        st.divider()
         st.subheader("เข้าสู่ระบบผู้ปกครอง")
         st.info("เลือกเลขที่ของบุตรหลานและใส่ PIN ที่ได้รับจากครูหรือกรรมการ")
         with st.form("parent_login_form"):
