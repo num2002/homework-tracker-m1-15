@@ -32,6 +32,23 @@ SHEETS = {
 }
 
 
+def anonymous_students() -> pd.DataFrame:
+    """Return the fixed anonymous roster (student numbers 1–40 only)."""
+    return pd.DataFrame([[number, "", ""] for number in range(1, 41)], columns=STUDENT_COLUMNS)
+
+
+def anonymize_frames(
+    students: pd.DataFrame, homework: pd.DataFrame, tracking: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Remove identifying student data while retaining the legacy sheet columns."""
+    students = anonymous_students()
+    tracking = tracking.reindex(columns=TRACKING_COLUMNS).copy()
+    if not tracking.empty:
+        tracking["รหัสนักเรียน"] = ""
+        tracking["ชื่อ-นามสกุล"] = ""
+    return students, homework, tracking
+
+
 def _style_sheet(ws, color: str, widths: list[int]) -> None:
     ws.freeze_panes = "A2"
     ws.sheet_view.showGridLines = False
@@ -73,7 +90,7 @@ def _normalize_workbook(path: Path) -> None:
     students = wb["Students"]
     if students.max_row <= 1:
         for number in range(1, 41):
-            students.append([number, "", f"นักเรียนเลขที่ {number}"])
+            students.append([number, "", ""])
 
     homework = wb["Homework"]
     for col in (4, 5):
@@ -210,7 +227,7 @@ def load_google_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     students = frames["Students"]
     if students.empty:
-        students = pd.DataFrame([[number, "", f"นักเรียนเลขที่ {number}"] for number in range(1, 41)], columns=STUDENT_COLUMNS)
+        students = anonymous_students()
         _write_google_worksheet(spreadsheet.worksheet("Students"), students, STUDENT_COLUMNS)
     students["เลขที่"] = pd.to_numeric(students["เลขที่"], errors="coerce")
     homework = frames["Homework"]
@@ -257,8 +274,8 @@ def save_google_frames(students: pd.DataFrame, homework: pd.DataFrame, tracking:
 
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if google_sheets_configured():
-        return load_google_data()
-    return load_excel_data()
+        return anonymize_frames(*load_google_data())
+    return anonymize_frames(*load_excel_data())
 
 
 def save_frames(students: pd.DataFrame, homework: pd.DataFrame, tracking: pd.DataFrame) -> None:
@@ -277,23 +294,26 @@ def frames_to_excel(students: pd.DataFrame, homework: pd.DataFrame, tracking: pd
     return buffer.getvalue()
 
 
-def require_login() -> None:
+def teacher_access() -> bool:
     configured_password = str(secret_value("APP_PASSWORD", "")).strip()
     if not configured_password:
-        return
+        return True
     if st.session_state.get("authenticated"):
-        return
-    st.title("🔐 Homework Tracker ม.1/15")
-    with st.form("login_form"):
-        password = st.text_input("รหัสผ่าน", type="password")
-        login = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
-    if login:
-        if password == configured_password:
-            st.session_state["authenticated"] = True
+        if st.sidebar.button("ออกจากโหมดครู", use_container_width=True):
+            st.session_state["authenticated"] = False
             st.rerun()
-        else:
-            st.error("รหัสผ่านไม่ถูกต้อง")
-    st.stop()
+        return True
+    with st.sidebar.expander("🔐 เข้าสู่ระบบสำหรับครู"):
+        with st.form("teacher_login_form"):
+            password = st.text_input("รหัสผ่านครู", type="password")
+            login = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
+        if login:
+            if password == configured_password:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("รหัสผ่านไม่ถูกต้อง")
+    return False
 
 
 def next_hw_id(homework: pd.DataFrame) -> str:
@@ -327,21 +347,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-require_login()
-st.title("📚 Homework Tracker ม.1/15")
-pages = ["Dashboard", "เพิ่มการบ้าน", "อัปเดตสถานะส่งงาน", "สรุปข้อความส่ง LINE", "รายชื่อนักเรียน"]
+is_teacher = teacher_access()
+st.title("📚 ติดตามการบ้าน ม.1/15")
+st.caption("สำหรับผู้ปกครอง · ใช้เฉพาะเลขที่ 1–40 ไม่มีการเก็บชื่อนักเรียน")
+pages = ["Dashboard", "สรุปข้อความส่ง LINE"]
+if is_teacher:
+    pages += ["เพิ่มการบ้าน", "อัปเดตสถานะส่งงาน"]
 page = st.sidebar.radio("เมนู", pages)
 storage_name = "Google Sheets ☁️" if google_sheets_configured() else f"Excel: {EXCEL_FILE.name}"
-st.sidebar.caption(f"ฐานข้อมูล: {storage_name}")
+if is_teacher:
+    st.sidebar.caption(f"ฐานข้อมูล: {storage_name}")
 with st.expander("💡 วิธีใช้งานฉบับย่อ"):
     st.markdown("""
-1. **รายชื่อนักเรียน** — แก้ชื่อและรหัสของนักเรียนทั้ง 40 คน แล้วกดบันทึก
-2. **เพิ่มการบ้าน** — กรอกวิชา งาน และกำหนดส่ง ระบบจะสร้างรายการติดตามให้นักเรียนทุกคน
-3. **อัปเดตสถานะส่งงาน** — เลือกงาน แก้สถานะ/วันที่ส่ง แล้วกดบันทึก (ส่งเกินกำหนดจะเปลี่ยนเป็น “ส่งช้า” อัตโนมัติ)
-4. **Dashboard** — ดูจำนวนส่งแล้ว ค้างส่ง และรายชื่อค้างส่งของทุกงาน
-5. **สรุปข้อความส่ง LINE** — เลือกงาน คัดลอกข้อความจากกล่อง หรือดาวน์โหลดไฟล์ข้อความ
+**ผู้ปกครอง:** ดูงาน กำหนดส่ง และเลขที่ที่ยังค้างส่งจาก Dashboard ได้ทันที
 
-> ควรปิดไฟล์ Excel ก่อนกดบันทึกในเว็บ เพราะ Windows อาจล็อกไฟล์ไว้
+**ครู:** เปิดเมนูด้านข้าง เข้าสู่ระบบ แล้วเพิ่มการบ้านหรืออัปเดตสถานะส่งงาน
+
+ระบบใช้เฉพาะเลขที่ 1–40 และไม่เก็บชื่อหรือรหัสนักเรียน
 """)
 
 try:
@@ -350,7 +372,7 @@ except Exception as exc:
     st.error(f"เปิดข้อมูลไม่ได้: {exc}")
     st.stop()
 
-if google_sheets_configured():
+if google_sheets_configured() and is_teacher:
     st.sidebar.download_button(
         "ดาวน์โหลดข้อมูลสำรอง Excel",
         data=frames_to_excel(students_df, homework_df, tracking_df),
@@ -377,9 +399,9 @@ if page == "Dashboard":
             rows = tracking_df[tracking_df["HW_ID"].astype(str) == str(hw["HW_ID"])]
             sent = int(rows["สถานะ"].isin(["ส่งแล้ว", "ส่งช้า"]).sum())
             pending = rows[rows["สถานะ"] == "ยังไม่ส่ง"]
-            names = ", ".join(f"{int(r['เลขที่'])}. {r['ชื่อ-นามสกุล']}" for _, r in pending.iterrows())
-            summary_rows.append({"HW_ID": hw["HW_ID"], "วิชา": hw["วิชา"], "งาน": hw["รายละเอียดงาน"], "กำหนดส่ง": hw["กำหนดส่ง"], "ส่งแล้ว": sent, "ค้างส่ง": len(pending), "รายชื่อค้างส่ง": names or "-"})
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True, column_config={"กำหนดส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "รายชื่อค้างส่ง": st.column_config.TextColumn(width="large")})
+            pending_numbers = ", ".join(str(int(number)) for number in pending["เลขที่"].dropna())
+            summary_rows.append({"HW_ID": hw["HW_ID"], "วิชา": hw["วิชา"], "งาน": hw["รายละเอียดงาน"], "กำหนดส่ง": hw["กำหนดส่ง"], "ส่งแล้ว": sent, "ค้างส่ง": len(pending), "เลขที่ค้างส่ง": pending_numbers or "-"})
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True, column_config={"กำหนดส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "เลขที่ค้างส่ง": st.column_config.TextColumn(width="large")})
 
 elif page == "เพิ่มการบ้าน":
     st.subheader("เพิ่มการบ้านใหม่")
@@ -402,7 +424,7 @@ elif page == "เพิ่มการบ้าน":
         else:
             new_hw = pd.DataFrame([[hw_id.strip(), subject.strip(), detail.strip(), pd.Timestamp(assigned), pd.Timestamp(due_date), note.strip()]], columns=HOMEWORK_COLUMNS)
             homework_df = pd.concat([homework_df, new_hw], ignore_index=True)
-            active_students = students_df[students_df["ชื่อ-นามสกุล"].astype(str).str.strip().ne("")].copy()
+            active_students = students_df.sort_values("เลขที่").copy()
             new_tracking = pd.DataFrame({"HW_ID": hw_id.strip(), "เลขที่": active_students["เลขที่"], "รหัสนักเรียน": active_students["รหัสนักเรียน"], "ชื่อ-นามสกุล": active_students["ชื่อ-นามสกุล"], "สถานะ": "ยังไม่ส่ง", "วันที่ส่ง": pd.NaT, "หมายเหตุ": ""})
             try:
                 save_frames(students_df, homework_df, pd.concat([tracking_df, new_tracking], ignore_index=True))
@@ -421,7 +443,7 @@ elif page == "อัปเดตสถานะส่งงาน":
         hw_id = options[selected]
         mask = tracking_df["HW_ID"].astype(str) == hw_id
         subset = tracking_df.loc[mask, TRACKING_COLUMNS].sort_values("เลขที่").reset_index(drop=True)
-        edited = st.data_editor(subset, use_container_width=True, hide_index=True, disabled=["HW_ID", "เลขที่", "รหัสนักเรียน", "ชื่อ-นามสกุล"], column_config={"สถานะ": st.column_config.SelectboxColumn(options=STATUSES, required=True), "วันที่ส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "หมายเหตุ": st.column_config.TextColumn(width="medium")}, key=f"editor-{hw_id}")
+        edited = st.data_editor(subset, use_container_width=True, hide_index=True, column_order=["เลขที่", "สถานะ", "วันที่ส่ง", "หมายเหตุ"], disabled=["HW_ID", "เลขที่", "รหัสนักเรียน", "ชื่อ-นามสกุล"], column_config={"สถานะ": st.column_config.SelectboxColumn(options=STATUSES, required=True), "วันที่ส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "หมายเหตุ": st.column_config.TextColumn(width="medium")}, key=f"editor-{hw_id}")
         if st.button("บันทึกสถานะ", type="primary", use_container_width=True):
             due_value = homework_df.loc[homework_df["HW_ID"].astype(str) == hw_id, "กำหนดส่ง"].iloc[0]
             edited["วันที่ส่ง"] = pd.to_datetime(edited["วันที่ส่ง"], errors="coerce")
@@ -444,29 +466,7 @@ elif page == "สรุปข้อความส่ง LINE":
         rows = tracking_df[tracking_df["HW_ID"].astype(str) == hw_id].sort_values("เลขที่")
         sent = int(rows["สถานะ"].isin(["ส่งแล้ว", "ส่งช้า"]).sum())
         pending = rows[rows["สถานะ"] == "ยังไม่ส่ง"]
-        pending_lines = [f"{i}. เลขที่ {int(row['เลขที่'])} {row['ชื่อ-นามสกุล']}" for i, (_, row) in enumerate(pending.iterrows(), 1)]
+        pending_lines = [f"{i}. เลขที่ {int(row['เลขที่'])}" for i, (_, row) in enumerate(pending.iterrows(), 1)]
         message = "\n".join(["สรุปการบ้าน ม.1/15", f"วิชา: {hw['วิชา']}", f"งาน: {hw['รายละเอียดงาน']}", f"กำหนดส่ง: {thai_date(hw['กำหนดส่ง'])}", "", f"ส่งแล้ว: {sent} คน", f"ค้างส่ง: {len(pending)} คน", "รายชื่อค้างส่ง:", *(pending_lines or ["ไม่มี 🎉"])])
         st.text_area("ข้อความพร้อมคัดลอก", value=message, height=360)
         st.download_button("ดาวน์โหลดเป็นไฟล์ข้อความ", message.encode("utf-8-sig"), file_name=f"LINE_{hw_id}.txt", mime="text/plain", use_container_width=True)
-
-else:
-    st.subheader("รายชื่อนักเรียน 40 คน")
-    st.caption("แก้ชื่อและรหัสนักเรียนได้โดยตรง เลขที่ต้องไม่ซ้ำกัน")
-    edited_students = st.data_editor(students_df, use_container_width=True, hide_index=True, num_rows="fixed", column_config={"เลขที่": st.column_config.NumberColumn(min_value=1, max_value=40, step=1, required=True), "รหัสนักเรียน": st.column_config.TextColumn(), "ชื่อ-นามสกุล": st.column_config.TextColumn(required=True)}, key="students_editor")
-    if st.button("บันทึกรายชื่อนักเรียน", type="primary", use_container_width=True):
-        numbers = pd.to_numeric(edited_students["เลขที่"], errors="coerce")
-        if len(edited_students) != 40 or numbers.isna().any() or numbers.duplicated().any():
-            st.error("ต้องมีนักเรียน 40 คน และเลขที่ 1–40 ต้องไม่ซ้ำกัน")
-        else:
-            edited_students["เลขที่"] = numbers.astype(int)
-            # Keep names in existing tracking rows synchronized by student number.
-            student_map = edited_students.set_index("เลขที่")
-            if not tracking_df.empty:
-                for idx, row in tracking_df.iterrows():
-                    number = int(row["เลขที่"])
-                    if number in student_map.index:
-                        tracking_df.at[idx, "รหัสนักเรียน"] = student_map.at[number, "รหัสนักเรียน"]
-                        tracking_df.at[idx, "ชื่อ-นามสกุล"] = student_map.at[number, "ชื่อ-นามสกุล"]
-            save_frames(edited_students.sort_values("เลขที่"), homework_df, tracking_df)
-            st.success("บันทึกรายชื่อแล้ว")
-            st.rerun()
