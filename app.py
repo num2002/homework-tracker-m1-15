@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import hashlib
+import hmac
 from io import BytesIO
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -294,25 +296,91 @@ def frames_to_excel(students: pd.DataFrame, homework: pd.DataFrame, tracking: pd
     return buffer.getvalue()
 
 
+def committee_accounts(master_password: str) -> list[dict[str, str]]:
+    accounts = []
+    for number in range(1, 6):
+        username = f"committee{number}"
+        digest = hmac.new(
+            master_password.encode("utf-8"),
+            f"m115-parent-network-{number}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        accounts.append(
+            {
+                "username": username,
+                "password": f"M115-{digest[:10]}",
+                "display_name": f"กรรมการผู้ปกครอง {number}",
+            }
+        )
+    return accounts
+
+
+def append_audit(action: str, detail: str = "") -> None:
+    if not google_sheets_configured():
+        return
+    spreadsheet = get_google_spreadsheet()
+    try:
+        worksheet = spreadsheet.worksheet("Audit_Log")
+    except WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title="Audit_Log", rows=1000, cols=4)
+        worksheet.append_row(["วันที่เวลา", "ผู้ใช้", "รายการ", "รายละเอียด"])
+    bangkok_time = datetime.utcnow() + timedelta(hours=7)
+    worksheet.append_row(
+        [
+            bangkok_time.strftime("%Y-%m-%d %H:%M:%S"),
+            st.session_state.get("editor_name", "ไม่ทราบผู้ใช้"),
+            action,
+            detail,
+        ]
+    )
+
+
 def teacher_access() -> bool:
     configured_password = str(secret_value("APP_PASSWORD", "")).strip()
     if not configured_password:
+        st.session_state.setdefault("editor_role", "teacher")
+        st.session_state.setdefault("editor_name", "ครูผู้ดูแล")
         return True
     if st.session_state.get("authenticated"):
-        if st.sidebar.button("ออกจากโหมดครู", use_container_width=True):
+        st.sidebar.success(f"กำลังแก้ไขในชื่อ: {st.session_state.get('editor_name', 'ผู้ดูแล')}")
+        if st.session_state.get("editor_role") == "teacher":
+            credentials = pd.DataFrame(committee_accounts(configured_password))
+            st.sidebar.download_button(
+                "ดาวน์โหลดบัญชีกรรมการ 5 คน",
+                credentials.to_csv(index=False).encode("utf-8-sig"),
+                file_name="committee_accounts_m1_15.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        if st.sidebar.button("ออกจากโหมดแก้ไข", use_container_width=True):
             st.session_state["authenticated"] = False
+            st.session_state.pop("editor_role", None)
+            st.session_state.pop("editor_name", None)
             st.rerun()
         return True
-    with st.sidebar.expander("🔐 เข้าสู่ระบบสำหรับครู"):
+    with st.sidebar.expander("🔐 เข้าสู่ระบบครู/กรรมการ"):
         with st.form("teacher_login_form"):
-            password = st.text_input("รหัสผ่านครู", type="password")
+            username = st.text_input("ชื่อผู้ใช้")
+            password = st.text_input("รหัสผ่าน", type="password")
             login = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
         if login:
-            if password == configured_password:
+            normalized_username = username.strip().lower()
+            account = next(
+                (item for item in committee_accounts(configured_password) if item["username"] == normalized_username),
+                None,
+            )
+            if normalized_username == "teacher" and hmac.compare_digest(password, configured_password):
                 st.session_state["authenticated"] = True
+                st.session_state["editor_role"] = "teacher"
+                st.session_state["editor_name"] = "ครูผู้ดูแล"
+                st.rerun()
+            elif account and hmac.compare_digest(password, account["password"]):
+                st.session_state["authenticated"] = True
+                st.session_state["editor_role"] = "committee"
+                st.session_state["editor_name"] = account["display_name"]
                 st.rerun()
             else:
-                st.error("รหัสผ่านไม่ถูกต้อง")
+                st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
     return False
 
 
@@ -361,7 +429,7 @@ with st.expander("💡 วิธีใช้งานฉบับย่อ"):
     st.markdown("""
 **ผู้ปกครอง:** ดูงาน กำหนดส่ง และเลขที่ที่ยังค้างส่งจาก Dashboard ได้ทันที
 
-**ครู:** เปิดเมนูด้านข้าง เข้าสู่ระบบ แล้วเพิ่มการบ้านหรืออัปเดตสถานะส่งงาน
+**ครูและกรรมการ 5 คน:** เปิดเมนูด้านข้าง เข้าสู่ระบบด้วยบัญชีของตน แล้วเพิ่มการบ้านหรืออัปเดตสถานะส่งงาน
 
 ระบบใช้เฉพาะเลขที่ 1–40 และไม่เก็บชื่อหรือรหัสนักเรียน
 """)
@@ -428,6 +496,7 @@ elif page == "เพิ่มการบ้าน":
             new_tracking = pd.DataFrame({"HW_ID": hw_id.strip(), "เลขที่": active_students["เลขที่"], "รหัสนักเรียน": active_students["รหัสนักเรียน"], "ชื่อ-นามสกุล": active_students["ชื่อ-นามสกุล"], "สถานะ": "ยังไม่ส่ง", "วันที่ส่ง": pd.NaT, "หมายเหตุ": ""})
             try:
                 save_frames(students_df, homework_df, pd.concat([tracking_df, new_tracking], ignore_index=True))
+                append_audit("เพิ่มการบ้าน", f"{hw_id.strip()} · {subject.strip()}")
                 st.success(f"เพิ่ม {hw_id} และสร้างรายการติดตาม {len(new_tracking)} คนแล้ว")
                 st.rerun()
             except PermissionError:
@@ -451,6 +520,7 @@ elif page == "อัปเดตสถานะส่งงาน":
             edited.loc[auto_late, "สถานะ"] = "ส่งช้า"
             tracking_df = pd.concat([tracking_df.loc[~mask], edited], ignore_index=True)
             save_frames(students_df, homework_df, tracking_df)
+            append_audit("อัปเดตสถานะ", hw_id)
             st.success("บันทึกสถานะแล้ว")
             st.rerun()
 
