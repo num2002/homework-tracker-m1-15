@@ -269,11 +269,15 @@ def save_google_frames(students: pd.DataFrame, homework: pd.DataFrame, tracking:
         ("Homework", homework, HOMEWORK_COLUMNS),
         ("Tracking", tracking, TRACKING_COLUMNS),
     ):
-        min_rows = max(len(frame) + 20, 200 if name != "Tracking" else 10000)
-        worksheet = _ensure_google_worksheet(spreadsheet, name, columns, min_rows)
+        try:
+            worksheet = spreadsheet.worksheet(name)
+        except WorksheetNotFound:
+            min_rows = max(len(frame) + 20, 200 if name != "Tracking" else 10000)
+            worksheet = _ensure_google_worksheet(spreadsheet, name, columns, min_rows)
         _write_google_worksheet(worksheet, frame, columns)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if google_sheets_configured():
         return anonymize_frames(*load_google_data())
@@ -285,6 +289,7 @@ def save_frames(students: pd.DataFrame, homework: pd.DataFrame, tracking: pd.Dat
         save_google_frames(students, homework, tracking)
     else:
         save_excel_frames(students, homework, tracking)
+    load_data.clear()
 
 
 def frames_to_excel(students: pd.DataFrame, homework: pd.DataFrame, tracking: pd.DataFrame) -> bytes:
@@ -315,7 +320,24 @@ def committee_accounts(master_password: str) -> list[dict[str, str]]:
     return accounts
 
 
-def append_audit(action: str, detail: str = "") -> None:
+def student_pin(master_password: str, student_number: int) -> str:
+    """Create a stable PIN without storing student names or PINs in Google Sheets."""
+    digest = hmac.new(
+        master_password.encode("utf-8"),
+        f"m115-student-{student_number}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"P{student_number:02d}-{digest[:6].upper()}"
+
+
+def student_pin_accounts(master_password: str) -> list[dict[str, str | int]]:
+    return [
+        {"เลขที่": number, "PIN ผู้ปกครอง": student_pin(master_password, number)}
+        for number in range(1, 41)
+    ]
+
+
+def append_audit(action: str, detail: str = "", actor: str | None = None) -> None:
     if not google_sheets_configured():
         return
     spreadsheet = get_google_spreadsheet()
@@ -328,10 +350,74 @@ def append_audit(action: str, detail: str = "") -> None:
     worksheet.append_row(
         [
             bangkok_time.strftime("%Y-%m-%d %H:%M:%S"),
-            st.session_state.get("editor_name", "ไม่ทราบผู้ใช้"),
+            actor or st.session_state.get("editor_name", "ไม่ทราบผู้ใช้"),
             action,
             detail,
         ]
+    )
+
+
+def submit_homework_for_student(
+    students: pd.DataFrame,
+    homework: pd.DataFrame,
+    tracking: pd.DataFrame,
+    hw_id: str,
+    student_number: int,
+) -> None:
+    """Update one student's submission with a narrow Google Sheets write."""
+    hw_rows = homework[homework["HW_ID"].astype(str) == str(hw_id)]
+    if hw_rows.empty:
+        raise ValueError("ไม่พบการบ้านที่เลือก")
+    due_date = pd.to_datetime(hw_rows.iloc[0]["กำหนดส่ง"], errors="coerce")
+    submitted_at = pd.Timestamp(date.today())
+    status = "ส่งช้า" if pd.notna(due_date) and submitted_at > due_date else "ส่งแล้ว"
+
+    if google_sheets_configured():
+        worksheet = get_google_spreadsheet().worksheet("Tracking")
+        values = worksheet.get_all_values()
+        target_row = None
+        for row_number, row in enumerate(values[1:], 2):
+            row_hw_id = row[0].strip() if len(row) > 0 else ""
+            try:
+                row_student_number = int(float(row[1])) if len(row) > 1 and row[1] else None
+            except ValueError:
+                row_student_number = None
+            if row_hw_id == str(hw_id) and row_student_number == student_number:
+                target_row = row_number
+                break
+        if target_row is None:
+            worksheet.append_row(
+                [str(hw_id), student_number, "", "", status, submitted_at.strftime("%Y-%m-%d"), "ผู้ปกครองแจ้งส่ง"]
+            )
+        else:
+            worksheet.update(
+                [[status, submitted_at.strftime("%Y-%m-%d"), "ผู้ปกครองแจ้งส่ง"]],
+                f"E{target_row}:G{target_row}",
+            )
+    else:
+        mask = (
+            (tracking["HW_ID"].astype(str) == str(hw_id))
+            & (pd.to_numeric(tracking["เลขที่"], errors="coerce") == student_number)
+        )
+        if mask.any():
+            tracking.loc[mask, ["สถานะ", "วันที่ส่ง", "หมายเหตุ"]] = [
+                status,
+                submitted_at,
+                "ผู้ปกครองแจ้งส่ง",
+            ]
+        else:
+            new_row = pd.DataFrame(
+                [[str(hw_id), student_number, "", "", status, submitted_at, "ผู้ปกครองแจ้งส่ง"]],
+                columns=TRACKING_COLUMNS,
+            )
+            tracking = pd.concat([tracking, new_row], ignore_index=True)
+        save_frames(students, homework, tracking)
+
+    load_data.clear()
+    append_audit(
+        "ผู้ปกครองแจ้งส่งการบ้าน",
+        f"{hw_id} · เลขที่ {student_number} · {status}",
+        actor=f"ผู้ปกครองเลขที่ {student_number}",
     )
 
 
@@ -349,6 +435,14 @@ def teacher_access() -> bool:
                 "ดาวน์โหลดบัญชีกรรมการ 5 คน",
                 credentials.to_csv(index=False).encode("utf-8-sig"),
                 file_name="committee_accounts_m1_15.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            parent_pins = pd.DataFrame(student_pin_accounts(configured_password))
+            st.sidebar.download_button(
+                "ดาวน์โหลด PIN ผู้ปกครอง 40 เลขที่",
+                parent_pins.to_csv(index=False).encode("utf-8-sig"),
+                file_name="parent_pins_m1_15.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
@@ -405,34 +499,27 @@ def homework_label(row: pd.Series) -> str:
     return f"{row['HW_ID']} · {row['วิชา']} · {row['รายละเอียดงาน']}"
 
 
-st.set_page_config(page_title="Homework Tracker ม.1/15", page_icon="📚", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
+st.set_page_config(
+    page_title="Homework Tracker ม.1/15",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+st.markdown(
+    """
 <style>
   .block-container {padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1200px;}
   [data-testid="stMetric"] {background:#f8fafc; border:1px solid #e2e8f0; padding:12px; border-radius:14px;}
   div[data-testid="stForm"] {border:1px solid #e2e8f0; border-radius:16px; padding:1rem;}
   @media (max-width: 640px) {.block-container {padding-left:.75rem; padding-right:.75rem;} h1 {font-size:1.65rem !important;}}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-is_teacher = teacher_access()
+is_editor = teacher_access()
 st.title("📚 ติดตามการบ้าน ม.1/15")
-st.caption("สำหรับผู้ปกครอง · ใช้เฉพาะเลขที่ 1–40 ไม่มีการเก็บชื่อนักเรียน")
-pages = ["Dashboard", "สรุปข้อความส่ง LINE"]
-if is_teacher:
-    pages += ["เพิ่มการบ้าน", "อัปเดตสถานะส่งงาน"]
-page = st.sidebar.radio("เมนู", pages)
-storage_name = "Google Sheets ☁️" if google_sheets_configured() else f"Excel: {EXCEL_FILE.name}"
-if is_teacher:
-    st.sidebar.caption(f"ฐานข้อมูล: {storage_name}")
-with st.expander("💡 วิธีใช้งานฉบับย่อ"):
-    st.markdown("""
-**ผู้ปกครอง:** ดูงาน กำหนดส่ง และเลขที่ที่ยังค้างส่งจาก Dashboard ได้ทันที
-
-**ครูและกรรมการ 5 คน:** เปิดเมนูด้านข้าง เข้าสู่ระบบด้วยบัญชีของตน แล้วเพิ่มการบ้านหรืออัปเดตสถานะส่งงาน
-
-ระบบใช้เฉพาะเลขที่ 1–40 และไม่เก็บชื่อหรือรหัสนักเรียน
-""")
+st.caption("ใช้เฉพาะเลขที่ 1–40 · ไม่เก็บชื่อหรือรหัสนักเรียน")
 
 try:
     students_df, homework_df, tracking_df = load_data()
@@ -440,7 +527,91 @@ except Exception as exc:
     st.error(f"เปิดข้อมูลไม่ได้: {exc}")
     st.stop()
 
-if google_sheets_configured() and is_teacher:
+storage_name = "Google Sheets ☁️" if google_sheets_configured() else f"Excel: {EXCEL_FILE.name}"
+pin_secret = str(secret_value("APP_PASSWORD", "m115-local-parent-pin"))
+
+if not is_editor:
+    if not st.session_state.get("parent_authenticated"):
+        st.subheader("เข้าสู่ระบบผู้ปกครอง")
+        st.info("เลือกเลขที่ของบุตรหลานและใส่ PIN ที่ได้รับจากครูหรือกรรมการ")
+        with st.form("parent_login_form"):
+            selected_number = st.selectbox("เลขที่นักเรียน", range(1, 41))
+            entered_pin = st.text_input("PIN ผู้ปกครอง", type="password")
+            parent_login = st.form_submit_button("ดูการบ้านของเลขที่นี้", type="primary", use_container_width=True)
+        if parent_login:
+            expected_pin = student_pin(pin_secret, int(selected_number))
+            if hmac.compare_digest(entered_pin.strip().upper(), expected_pin):
+                st.session_state["parent_authenticated"] = True
+                st.session_state["parent_number"] = int(selected_number)
+                st.rerun()
+            else:
+                st.error("เลขที่หรือ PIN ไม่ถูกต้อง")
+        st.stop()
+
+    parent_number = int(st.session_state["parent_number"])
+    st.sidebar.success(f"ผู้ปกครองเลขที่ {parent_number}")
+    if st.sidebar.button("เปลี่ยนเลขที่ / ออกจากระบบ", use_container_width=True):
+        st.session_state.pop("parent_authenticated", None)
+        st.session_state.pop("parent_number", None)
+        st.rerun()
+
+    st.subheader(f"งานของนักเรียนเลขที่ {parent_number}")
+    own_rows = tracking_df[
+        pd.to_numeric(tracking_df["เลขที่"], errors="coerce") == parent_number
+    ].copy()
+    own_status = {
+        str(row["HW_ID"]): row["สถานะ"] or "ยังไม่ส่ง"
+        for _, row in own_rows.drop_duplicates("HW_ID", keep="last").iterrows()
+    }
+    pending_count = sum(
+        own_status.get(str(row["HW_ID"]), "ยังไม่ส่ง") == "ยังไม่ส่ง"
+        for _, row in homework_df.iterrows()
+    )
+    sent_count = sum(
+        own_status.get(str(row["HW_ID"]), "ยังไม่ส่ง") in ["ส่งแล้ว", "ส่งช้า"]
+        for _, row in homework_df.iterrows()
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("งานทั้งหมด", len(homework_df))
+    c2.metric("ค้างส่ง", pending_count)
+    c3.metric("ส่งแล้ว", sent_count)
+
+    if homework_df.empty:
+        st.info("ยังไม่มีการบ้าน")
+    else:
+        ordered_homework = homework_df.sort_values("กำหนดส่ง", ascending=False, na_position="last")
+        for _, hw in ordered_homework.iterrows():
+            hw_id = str(hw["HW_ID"])
+            status = own_status.get(hw_id, "ยังไม่ส่ง")
+            icon = "⏳" if status == "ยังไม่ส่ง" else "✅" if status == "ส่งแล้ว" else "🕒" if status == "ส่งช้า" else "➖"
+            with st.container(border=True):
+                st.markdown(f"### {icon} {hw['วิชา']} — {status}")
+                st.write(hw["รายละเอียดงาน"])
+                st.caption(f"กำหนดส่ง: {thai_date(hw['กำหนดส่ง'])}")
+                if str(hw.get("หมายเหตุ", "")).strip():
+                    st.caption(f"หมายเหตุ: {hw['หมายเหตุ']}")
+                if status == "ยังไม่ส่ง":
+                    if st.button("แจ้งว่าส่งการบ้านแล้ว", key=f"parent-submit-{parent_number}-{hw_id}", type="primary", use_container_width=True):
+                        try:
+                            submit_homework_for_student(
+                                students_df, homework_df, tracking_df, hw_id, parent_number
+                            )
+                            st.success("บันทึกการส่งแล้ว")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"บันทึกไม่ได้: {exc}")
+    st.stop()
+
+pages = [
+    "ภาพรวมทั้งห้อง",
+    "เพิ่มการบ้าน",
+    "แก้ไขการบ้าน",
+    "อัปเดตสถานะส่งงาน",
+    "สรุปข้อความส่ง LINE",
+]
+page = st.sidebar.radio("เมนูครู/กรรมการ", pages)
+st.sidebar.caption(f"ฐานข้อมูล: {storage_name}")
+if google_sheets_configured():
     st.sidebar.download_button(
         "ดาวน์โหลดข้อมูลสำรอง Excel",
         data=frames_to_excel(students_df, homework_df, tracking_df),
@@ -449,27 +620,33 @@ if google_sheets_configured() and is_teacher:
         use_container_width=True,
     )
 
-if page == "Dashboard":
-    st.subheader("ภาพรวมการส่งงาน")
+if page == "ภาพรวมทั้งห้อง":
+    st.subheader("ภาพรวมทั้งห้องสำหรับครู/กรรมการ")
     today = pd.Timestamp(date.today())
     due = pd.to_datetime(homework_df["กำหนดส่ง"], errors="coerce") if not homework_df.empty else pd.Series(dtype="datetime64[ns]")
     near_due = int(((due >= today) & (due <= today + pd.Timedelta(days=7))).sum())
     c1, c2, c3 = st.columns(3)
     c1.metric("งานทั้งหมด", len(homework_df))
     c2.metric("ใกล้ครบกำหนด (7 วัน)", near_due)
-    pending_total = int((tracking_df["สถานะ"] == "ยังไม่ส่ง").sum()) if not tracking_df.empty else 0
-    c3.metric("รายการค้างส่ง", pending_total)
+    c3.metric("รายการค้างส่ง", int((tracking_df["สถานะ"] == "ยังไม่ส่ง").sum()) if not tracking_df.empty else 0)
     if homework_df.empty:
-        st.info("ยังไม่มีการบ้าน เลือกเมนู “เพิ่มการบ้าน” เพื่อเริ่มต้น")
+        st.info("ยังไม่มีการบ้าน")
     else:
         summary_rows = []
         for _, hw in homework_df.sort_values("กำหนดส่ง", na_position="last").iterrows():
             rows = tracking_df[tracking_df["HW_ID"].astype(str) == str(hw["HW_ID"])]
             sent = int(rows["สถานะ"].isin(["ส่งแล้ว", "ส่งช้า"]).sum())
             pending = rows[rows["สถานะ"] == "ยังไม่ส่ง"]
-            pending_numbers = ", ".join(str(int(number)) for number in pending["เลขที่"].dropna())
-            summary_rows.append({"HW_ID": hw["HW_ID"], "วิชา": hw["วิชา"], "งาน": hw["รายละเอียดงาน"], "กำหนดส่ง": hw["กำหนดส่ง"], "ส่งแล้ว": sent, "ค้างส่ง": len(pending), "เลขที่ค้างส่ง": pending_numbers or "-"})
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True, column_config={"กำหนดส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "เลขที่ค้างส่ง": st.column_config.TextColumn(width="large")})
+            pending_numbers = ", ".join(str(int(number)) for number in pd.to_numeric(pending["เลขที่"], errors="coerce").dropna())
+            summary_rows.append({
+                "HW_ID": hw["HW_ID"], "วิชา": hw["วิชา"], "งาน": hw["รายละเอียดงาน"],
+                "กำหนดส่ง": hw["กำหนดส่ง"], "ส่งแล้ว": sent, "ค้างส่ง": len(pending),
+                "เลขที่ค้างส่ง": pending_numbers or "-",
+            })
+        st.dataframe(
+            pd.DataFrame(summary_rows), use_container_width=True, hide_index=True,
+            column_config={"กำหนดส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "เลขที่ค้างส่ง": st.column_config.TextColumn(width="large")},
+        )
 
 elif page == "เพิ่มการบ้าน":
     st.subheader("เพิ่มการบ้านใหม่")
@@ -481,48 +658,131 @@ elif page == "เพิ่มการบ้าน":
         assigned = c1.date_input("วันที่สั่ง", value=date.today())
         due_date = c2.date_input("กำหนดส่ง", value=date.today() + timedelta(days=7))
         note = st.text_area("หมายเหตุ")
-        submitted = st.form_submit_button("เพิ่มการบ้านและสร้างรายการ 40 คน", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("เพิ่มการบ้านและสร้างรายการ 40 เลขที่", type="primary", use_container_width=True)
     if submitted:
         errors = []
-        if not hw_id.strip() or not subject.strip() or not detail.strip(): errors.append("กรุณากรอก HW_ID วิชา และรายละเอียดงาน")
-        if hw_id.strip() in set(homework_df["HW_ID"].astype(str)): errors.append("HW_ID นี้มีอยู่แล้ว")
-        if due_date < assigned: errors.append("กำหนดส่งต้องไม่ก่อนวันที่สั่ง")
+        if not hw_id.strip() or not subject.strip() or not detail.strip():
+            errors.append("กรุณากรอก HW_ID วิชา และรายละเอียดงาน")
+        if hw_id.strip() in set(homework_df["HW_ID"].astype(str)):
+            errors.append("HW_ID นี้มีอยู่แล้ว")
+        if due_date < assigned:
+            errors.append("กำหนดส่งต้องไม่ก่อนวันที่สั่ง")
         if errors:
             st.error(" · ".join(errors))
         else:
             new_hw = pd.DataFrame([[hw_id.strip(), subject.strip(), detail.strip(), pd.Timestamp(assigned), pd.Timestamp(due_date), note.strip()]], columns=HOMEWORK_COLUMNS)
-            homework_df = pd.concat([homework_df, new_hw], ignore_index=True)
-            active_students = students_df.sort_values("เลขที่").copy()
-            new_tracking = pd.DataFrame({"HW_ID": hw_id.strip(), "เลขที่": active_students["เลขที่"], "รหัสนักเรียน": active_students["รหัสนักเรียน"], "ชื่อ-นามสกุล": active_students["ชื่อ-นามสกุล"], "สถานะ": "ยังไม่ส่ง", "วันที่ส่ง": pd.NaT, "หมายเหตุ": ""})
+            new_tracking = pd.DataFrame({
+                "HW_ID": hw_id.strip(), "เลขที่": range(1, 41), "รหัสนักเรียน": "", "ชื่อ-นามสกุล": "",
+                "สถานะ": "ยังไม่ส่ง", "วันที่ส่ง": pd.NaT, "หมายเหตุ": "",
+            })
             try:
-                save_frames(students_df, homework_df, pd.concat([tracking_df, new_tracking], ignore_index=True))
+                save_frames(
+                    students_df,
+                    pd.concat([homework_df, new_hw], ignore_index=True),
+                    pd.concat([tracking_df, new_tracking], ignore_index=True),
+                )
                 append_audit("เพิ่มการบ้าน", f"{hw_id.strip()} · {subject.strip()}")
-                st.success(f"เพิ่ม {hw_id} และสร้างรายการติดตาม {len(new_tracking)} คนแล้ว")
+                st.success(f"เพิ่ม {hw_id} และสร้างรายการติดตาม 40 เลขที่แล้ว")
                 st.rerun()
-            except PermissionError:
-                st.error("บันทึกไม่ได้ กรุณาปิดไฟล์ Excel แล้วลองใหม่")
+            except Exception as exc:
+                st.error(f"บันทึกไม่ได้: {exc}")
 
-elif page == "อัปเดตสถานะส่งงาน":
-    st.subheader("อัปเดตสถานะส่งงาน")
+elif page == "แก้ไขการบ้าน":
+    st.subheader("แก้ไขข้อความและกำหนดส่ง")
     if homework_df.empty:
         st.info("ยังไม่มีการบ้าน")
     else:
         options = {homework_label(row): str(row["HW_ID"]) for _, row in homework_df.iloc[::-1].iterrows()}
-        selected = st.selectbox("เลือกการบ้าน", list(options))
-        hw_id = options[selected]
-        mask = tracking_df["HW_ID"].astype(str) == hw_id
-        subset = tracking_df.loc[mask, TRACKING_COLUMNS].sort_values("เลขที่").reset_index(drop=True)
-        edited = st.data_editor(subset, use_container_width=True, hide_index=True, column_order=["เลขที่", "สถานะ", "วันที่ส่ง", "หมายเหตุ"], disabled=["HW_ID", "เลขที่", "รหัสนักเรียน", "ชื่อ-นามสกุล"], column_config={"สถานะ": st.column_config.SelectboxColumn(options=STATUSES, required=True), "วันที่ส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"), "หมายเหตุ": st.column_config.TextColumn(width="medium")}, key=f"editor-{hw_id}")
-        if st.button("บันทึกสถานะ", type="primary", use_container_width=True):
-            due_value = homework_df.loc[homework_df["HW_ID"].astype(str) == hw_id, "กำหนดส่ง"].iloc[0]
+        selected = st.selectbox("เลือกการบ้านที่ต้องการแก้ไข", list(options), key="edit_hw_select")
+        edit_hw_id = options[selected]
+        hw_index = homework_df.index[homework_df["HW_ID"].astype(str) == edit_hw_id][0]
+        hw = homework_df.loc[hw_index]
+        assigned_value = pd.Timestamp(hw["วันที่สั่ง"]).date() if pd.notna(hw["วันที่สั่ง"]) else date.today()
+        due_value = pd.Timestamp(hw["กำหนดส่ง"]).date() if pd.notna(hw["กำหนดส่ง"]) else date.today()
+        with st.form(f"edit_homework_form_{edit_hw_id}"):
+            st.text_input("HW_ID", value=edit_hw_id, disabled=True)
+            subject = st.text_input("วิชา *", value=str(hw["วิชา"] or ""))
+            detail = st.text_area("รายละเอียดงาน *", value=str(hw["รายละเอียดงาน"] or ""), height=140)
+            c1, c2 = st.columns(2)
+            assigned = c1.date_input("วันที่สั่ง", value=assigned_value)
+            due_date = c2.date_input("กำหนดส่ง", value=due_value)
+            note = st.text_area("หมายเหตุ", value=str(hw["หมายเหตุ"] or ""))
+            save_homework = st.form_submit_button("บันทึกการแก้ไข", type="primary", use_container_width=True)
+        if save_homework:
+            if not subject.strip() or not detail.strip():
+                st.error("กรุณากรอกวิชาและรายละเอียดงาน")
+            elif due_date < assigned:
+                st.error("กำหนดส่งต้องไม่ก่อนวันที่สั่ง")
+            else:
+                homework_df.loc[hw_index, HOMEWORK_COLUMNS[1:]] = [
+                    subject.strip(), detail.strip(), pd.Timestamp(assigned), pd.Timestamp(due_date), note.strip()
+                ]
+                try:
+                    save_frames(students_df, homework_df, tracking_df)
+                    append_audit("แก้ไขการบ้าน", f"{edit_hw_id} · {subject.strip()}")
+                    st.success("บันทึกข้อความการบ้านแล้ว")
+                except Exception as exc:
+                    st.error(f"บันทึกไม่ได้: {exc}")
+
+elif page == "อัปเดตสถานะส่งงาน":
+    st.subheader("อัปเดตสถานะเลขที่ 1–40")
+    if homework_df.empty:
+        st.info("ยังไม่มีการบ้าน")
+    else:
+        options = {homework_label(row): str(row["HW_ID"]) for _, row in homework_df.iloc[::-1].iterrows()}
+        selected = st.selectbox("เลือกการบ้าน", list(options), key="status_hw_select")
+        status_hw_id = options[selected]
+        mask = tracking_df["HW_ID"].astype(str) == status_hw_id
+        existing = tracking_df.loc[mask].copy()
+        existing["เลขที่"] = pd.to_numeric(existing["เลขที่"], errors="coerce")
+        existing = existing.dropna(subset=["เลขที่"]).drop_duplicates("เลขที่", keep="last").set_index("เลขที่")
+        visible = pd.DataFrame({"เลขที่": range(1, 41)})
+        visible["สถานะ"] = visible["เลขที่"].map(existing["สถานะ"] if "สถานะ" in existing else {}).fillna("ยังไม่ส่ง")
+        visible["วันที่ส่ง"] = pd.to_datetime(visible["เลขที่"].map(existing["วันที่ส่ง"] if "วันที่ส่ง" in existing else {}), errors="coerce")
+        visible["หมายเหตุ"] = visible["เลขที่"].map(existing["หมายเหตุ"] if "หมายเหตุ" in existing else {}).fillna("")
+        edited = st.data_editor(
+            visible,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["เลขที่"],
+            column_config={
+                "เลขที่": st.column_config.NumberColumn(format="%d", width="small"),
+                "สถานะ": st.column_config.SelectboxColumn(options=STATUSES, required=True),
+                "วันที่ส่ง": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "หมายเหตุ": st.column_config.TextColumn(width="medium"),
+            },
+            key=f"status-editor-{status_hw_id}",
+        )
+        st.caption("แตะช่องสถานะของเลขที่ที่ต้องการ แล้วกดบันทึกด้านล่าง")
+        if st.button("บันทึกสถานะทั้ง 40 เลขที่", type="primary", use_container_width=True):
+            edited = edited.copy()
+            edited["สถานะ"] = edited["สถานะ"].where(edited["สถานะ"].isin(STATUSES), "ยังไม่ส่ง")
             edited["วันที่ส่ง"] = pd.to_datetime(edited["วันที่ส่ง"], errors="coerce")
-            auto_late = (edited["สถานะ"] == "ส่งแล้ว") & edited["วันที่ส่ง"].notna() & (edited["วันที่ส่ง"] > pd.Timestamp(due_value))
-            edited.loc[auto_late, "สถานะ"] = "ส่งช้า"
-            tracking_df = pd.concat([tracking_df.loc[~mask], edited], ignore_index=True)
-            save_frames(students_df, homework_df, tracking_df)
-            append_audit("อัปเดตสถานะ", hw_id)
-            st.success("บันทึกสถานะแล้ว")
-            st.rerun()
+            sent_without_date = edited["สถานะ"].isin(["ส่งแล้ว", "ส่งช้า"]) & edited["วันที่ส่ง"].isna()
+            edited.loc[sent_without_date, "วันที่ส่ง"] = pd.Timestamp(date.today())
+            due_value = pd.to_datetime(
+                homework_df.loc[homework_df["HW_ID"].astype(str) == status_hw_id, "กำหนดส่ง"].iloc[0],
+                errors="coerce",
+            )
+            if pd.notna(due_value):
+                auto_late = (edited["สถานะ"] == "ส่งแล้ว") & edited["วันที่ส่ง"].notna() & (edited["วันที่ส่ง"] > due_value)
+                edited.loc[auto_late, "สถานะ"] = "ส่งช้า"
+            replacement = pd.DataFrame({
+                "HW_ID": status_hw_id,
+                "เลขที่": edited["เลขที่"].astype(int),
+                "รหัสนักเรียน": "",
+                "ชื่อ-นามสกุล": "",
+                "สถานะ": edited["สถานะ"],
+                "วันที่ส่ง": edited["วันที่ส่ง"],
+                "หมายเหตุ": edited["หมายเหตุ"].fillna(""),
+            })
+            try:
+                tracking_df = pd.concat([tracking_df.loc[~mask], replacement], ignore_index=True)
+                save_frames(students_df, homework_df, tracking_df)
+                append_audit("อัปเดตสถานะ", status_hw_id)
+                st.success("บันทึกสถานะทั้ง 40 เลขที่แล้ว")
+            except Exception as exc:
+                st.error(f"บันทึกไม่ได้: {exc}")
 
 elif page == "สรุปข้อความส่ง LINE":
     st.subheader("สร้างข้อความสรุปสำหรับ LINE")
@@ -531,12 +791,16 @@ elif page == "สรุปข้อความส่ง LINE":
     else:
         options = {homework_label(row): str(row["HW_ID"]) for _, row in homework_df.iloc[::-1].iterrows()}
         selected = st.selectbox("เลือกการบ้าน", list(options), key="line_hw")
-        hw_id = options[selected]
-        hw = homework_df[homework_df["HW_ID"].astype(str) == hw_id].iloc[0]
-        rows = tracking_df[tracking_df["HW_ID"].astype(str) == hw_id].sort_values("เลขที่")
+        line_hw_id = options[selected]
+        hw = homework_df[homework_df["HW_ID"].astype(str) == line_hw_id].iloc[0]
+        rows = tracking_df[tracking_df["HW_ID"].astype(str) == line_hw_id].sort_values("เลขที่")
         sent = int(rows["สถานะ"].isin(["ส่งแล้ว", "ส่งช้า"]).sum())
         pending = rows[rows["สถานะ"] == "ยังไม่ส่ง"]
         pending_lines = [f"{i}. เลขที่ {int(row['เลขที่'])}" for i, (_, row) in enumerate(pending.iterrows(), 1)]
-        message = "\n".join(["สรุปการบ้าน ม.1/15", f"วิชา: {hw['วิชา']}", f"งาน: {hw['รายละเอียดงาน']}", f"กำหนดส่ง: {thai_date(hw['กำหนดส่ง'])}", "", f"ส่งแล้ว: {sent} คน", f"ค้างส่ง: {len(pending)} คน", "รายชื่อค้างส่ง:", *(pending_lines or ["ไม่มี 🎉"])])
+        message = "\n".join([
+            "สรุปการบ้าน ม.1/15", f"วิชา: {hw['วิชา']}", f"งาน: {hw['รายละเอียดงาน']}",
+            f"กำหนดส่ง: {thai_date(hw['กำหนดส่ง'])}", "", f"ส่งแล้ว: {sent} คน",
+            f"ค้างส่ง: {len(pending)} คน", "รายชื่อค้างส่ง:", *(pending_lines or ["ไม่มี 🎉"]),
+        ])
         st.text_area("ข้อความพร้อมคัดลอก", value=message, height=360)
-        st.download_button("ดาวน์โหลดเป็นไฟล์ข้อความ", message.encode("utf-8-sig"), file_name=f"LINE_{hw_id}.txt", mime="text/plain", use_container_width=True)
+        st.download_button("ดาวน์โหลดเป็นไฟล์ข้อความ", message.encode("utf-8-sig"), file_name=f"LINE_{line_hw_id}.txt", mime="text/plain", use_container_width=True)
